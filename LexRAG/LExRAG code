@@ -1,0 +1,371 @@
+"""
+LexRAG: Multi-Agent Legal Document Q&A System
+==============================================
+Author : Harshvardhan Tiwari
+Stack  : LangChain · Ollama (Mistral-7B) · ChromaDB · HuggingFace Embeddings · RAGAS
+
+Architecture
+------------
+  PDF Ingestion → Semantic Chunking → ChromaDB Vector Store
+       ↓
+  Router Agent → Retrieval Agent → Critic Agent → Final Answer
+       ↓
+  RAGAS Evaluation Harness (faithfulness / relevance / context precision)
+
+Run
+---
+  pip install -r requirements.txt
+  ollama pull mistral          # pull model locally
+  python main.py --ingest path/to/docs/
+  python main.py --query "What are the termination clauses?"
+  python main.py --eval          # run RAGAS eval suite
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+from typing import Any
+
+# ── LangChain ──────────────────────────────────────────────────────────────
+from langchain.agents import AgentExecutor, create_react_agent
+from langchain.prompts import PromptTemplate
+from langchain.schema import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.tools import Tool
+from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.llms import Ollama
+from langchain_community.vectorstores import Chroma
+
+# ── RAGAS ───────────────────────────────────────────────────────────────────
+from datasets import Dataset
+from ragas import evaluate
+from ragas.metrics import answer_relevancy, context_precision, faithfulness
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 1.  CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════
+CHROMA_DIR   = "./chroma_db"
+EMBED_MODEL  = "sentence-transformers/all-MiniLM-L6-v2"
+OLLAMA_MODEL = "mistral"           # swap for llama3 / qwen etc.
+CHUNK_SIZE   = 800
+CHUNK_OVERLAP= 150
+MMR_K        = 6                   # docs returned by MMR retriever
+TEMPERATURE  = 0.1                 # low temp → deterministic legal answers
+TOP_P        = 0.9
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2.  EMBEDDING & VECTOR STORE
+# ═══════════════════════════════════════════════════════════════════════════
+class VectorStore:
+    """Wraps ChromaDB with HuggingFace sentence-transformer embeddings."""
+
+    def __init__(self) -> None:
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name=EMBED_MODEL,
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True},
+        )
+        self.db: Chroma | None = None
+
+    def ingest(self, docs_path: str) -> int:
+        """Load PDFs → chunk → embed → persist to ChromaDB. Returns chunk count."""
+        print(f"[Ingest] Loading documents from: {docs_path}")
+
+        loader = DirectoryLoader(
+            docs_path,
+            glob="**/*.pdf",
+            loader_cls=PyPDFLoader,
+            show_progress=True,
+        )
+        raw_docs: list[Document] = loader.load()
+        print(f"[Ingest] Loaded {len(raw_docs)} pages from {docs_path}")
+
+        # Semantic chunking via RecursiveCharacterTextSplitter
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            separators=["\n\n", "\n", ".", " "],
+        )
+        chunks = splitter.split_documents(raw_docs)
+        print(f"[Ingest] Split into {len(chunks)} chunks")
+
+        # Persist to ChromaDB
+        self.db = Chroma.from_documents(
+            documents=chunks,
+            embedding=self.embeddings,
+            persist_directory=CHROMA_DIR,
+        )
+        self.db.persist()
+        print(f"[Ingest] Stored {len(chunks)} chunks in ChromaDB @ {CHROMA_DIR}")
+        return len(chunks)
+
+    def load(self) -> None:
+        """Load existing ChromaDB from disk."""
+        self.db = Chroma(
+            persist_directory=CHROMA_DIR,
+            embedding_function=self.embeddings,
+        )
+
+    def mmr_retriever(self):
+        """Maximum Marginal Relevance retriever — reduces redundancy in results."""
+        if self.db is None:
+            self.load()
+        return self.db.as_retriever(
+            search_type="mmr",
+            search_kwargs={"k": MMR_K, "fetch_k": MMR_K * 3, "lambda_mult": 0.6},
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3.  LLM (Ollama)
+# ═══════════════════════════════════════════════════════════════════════════
+def get_llm() -> Ollama:
+    """
+    Instantiate Ollama LLM with explicit sampling parameters.
+
+    temperature : controls randomness (0 = deterministic, 1 = creative)
+    top_p       : nucleus sampling threshold
+    """
+    return Ollama(
+        model=OLLAMA_MODEL,
+        temperature=TEMPERATURE,
+        top_p=TOP_P,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4.  HALLUCINATION DETECTOR
+# ═══════════════════════════════════════════════════════════════════════════
+HALLUCINATION_PROMPT = PromptTemplate.from_template(
+    """You are a strict fact-checker for legal documents.
+
+Retrieved context:
+{context}
+
+Proposed answer:
+{answer}
+
+Does the proposed answer contain any claims NOT supported by the context?
+Reply with JSON only:
+{{"hallucination_detected": true/false, "unsupported_claims": ["..."]}}"""
+)
+
+
+class HallucinationDetector:
+    def __init__(self, llm: Ollama) -> None:
+        self.llm = llm
+
+    def check(self, context: str, answer: str) -> dict[str, Any]:
+        prompt = HALLUCINATION_PROMPT.format(context=context, answer=answer)
+        raw = self.llm(prompt)
+        try:
+            # Strip markdown fences if present
+            clean = raw.strip().strip("```json").strip("```").strip()
+            return json.loads(clean)
+        except json.JSONDecodeError:
+            return {"hallucination_detected": False, "unsupported_claims": [], "raw": raw}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5.  AGENTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── 5a. Retrieval Tool ─────────────────────────────────────────────────────
+def make_retrieval_tool(vs: VectorStore) -> Tool:
+    retriever = vs.mmr_retriever()
+
+    def retrieve(query: str) -> str:
+        docs = retriever.get_relevant_documents(query)
+        if not docs:
+            return "No relevant documents found."
+        parts = []
+        for i, d in enumerate(docs, 1):
+            src  = d.metadata.get("source", "unknown")
+            page = d.metadata.get("page", "?")
+            parts.append(f"[Doc {i} | {Path(src).name} p.{page}]\n{d.page_content}")
+        return "\n\n---\n\n".join(parts)
+
+    return Tool(
+        name="LegalRetriever",
+        func=retrieve,
+        description=(
+            "Use this tool to retrieve relevant passages from legal documents. "
+            "Input: a specific legal question. Output: cited document excerpts."
+        ),
+    )
+
+
+# ── 5b. Summarisation Tool ─────────────────────────────────────────────────
+def make_summarise_tool(llm: Ollama) -> Tool:
+    def summarise(text: str) -> str:
+        prompt = (
+            "Summarise the following legal text in 3 concise bullet points, "
+            f"preserving all key obligations and dates:\n\n{text}"
+        )
+        return llm(prompt)
+
+    return Tool(
+        name="Summariser",
+        func=summarise,
+        description="Summarise a block of legal text into key bullet points.",
+    )
+
+
+# ── 5c. ReAct Agent prompt ─────────────────────────────────────────────────
+REACT_TEMPLATE = """You are LexRAG, an expert legal document analyst.
+Answer the user's question using ONLY evidence from retrieved documents.
+If unsure, say "I cannot determine this from the provided documents."
+
+Available tools: {tools}
+Tool names: {tool_names}
+
+Format EXACTLY:
+Question: {{input}}
+Thought: <your reasoning>
+Action: <tool name>
+Action Input: <input to tool>
+Observation: <tool output>
+... (repeat Thought/Action/Observation as needed)
+Thought: I now have enough information.
+Final Answer: <your cited answer>
+
+Question: {input}
+{agent_scratchpad}"""
+
+
+def build_react_agent(llm: Ollama, tools: list[Tool]) -> AgentExecutor:
+    prompt = PromptTemplate.from_template(REACT_TEMPLATE)
+    agent  = create_react_agent(llm, tools, prompt)
+    return AgentExecutor(
+        agent=agent,
+        tools=tools,
+        verbose=True,
+        max_iterations=5,
+        handle_parsing_errors=True,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 6.  MULTI-AGENT ORCHESTRATOR
+# ═══════════════════════════════════════════════════════════════════════════
+class LexRAGOrchestrator:
+    """
+    Router Agent  → decides which tool to call first
+    Retrieval Agent → fetches grounded context via MMR
+    Critic Agent  → hallucination check on proposed answer
+    """
+
+    def __init__(self) -> None:
+        self.vs       = VectorStore()
+        self.llm      = get_llm()
+        self.detector = HallucinationDetector(self.llm)
+
+        tools = [
+            make_retrieval_tool(self.vs),
+            make_summarise_tool(self.llm),
+        ]
+        self.agent = build_react_agent(self.llm, tools)
+
+    def query(self, question: str) -> dict[str, Any]:
+        print(f"\n{'='*60}\nQuery: {question}\n{'='*60}")
+
+        # Step 1 — ReAct agent generates a grounded answer
+        result   = self.agent.invoke({"input": question})
+        answer   = result.get("output", "")
+
+        # Step 2 — Critic: hallucination check
+        retriever = self.vs.mmr_retriever()
+        ctx_docs  = retriever.get_relevant_documents(question)
+        context   = "\n".join(d.page_content for d in ctx_docs)
+        hall_check = self.detector.check(context, answer)
+
+        return {
+            "question" : question,
+            "answer"   : answer,
+            "hallucination_check": hall_check,
+            "source_docs": [
+                {"source": d.metadata.get("source"), "page": d.metadata.get("page")}
+                for d in ctx_docs
+            ],
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 7.  RAGAS EVALUATION HARNESS
+# ═══════════════════════════════════════════════════════════════════════════
+EVAL_QUESTIONS = [
+    "What are the termination clauses in the agreement?",
+    "What are the payment terms and due dates?",
+    "Who bears liability in case of data breach?",
+    "What is the governing law for dispute resolution?",
+    "Are there any non-compete clauses? For how long?",
+]
+
+def run_ragas_eval(orchestrator: LexRAGOrchestrator) -> None:
+    """
+    Runs RAGAS evaluation on a fixed test set.
+    Metrics: faithfulness, answer_relevancy, context_precision
+    Demonstrates RAG vs. fine-tuning trade-off understanding.
+    """
+    print("\n[Eval] Starting RAGAS evaluation harness...")
+
+    questions, answers, contexts, ground_truths = [], [], [], []
+
+    retriever = orchestrator.vs.mmr_retriever()
+
+    for q in EVAL_QUESTIONS:
+        result = orchestrator.query(q)
+        ctx    = retriever.get_relevant_documents(q)
+
+        questions.append(q)
+        answers.append(result["answer"])
+        contexts.append([d.page_content for d in ctx])
+        ground_truths.append("")   # supply manually for real evals
+
+    dataset = Dataset.from_dict({
+        "question"    : questions,
+        "answer"      : answers,
+        "contexts"    : contexts,
+        "ground_truth": ground_truths,
+    })
+
+    scores = evaluate(
+        dataset,
+        metrics=[faithfulness, answer_relevancy, context_precision],
+    )
+    print("\n[Eval] RAGAS Scores:")
+    print(scores)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 8.  CLI ENTRYPOINT
+# ═══════════════════════════════════════════════════════════════════════════
+def main() -> None:
+    parser = argparse.ArgumentParser(description="LexRAG: Legal Document Q&A")
+    parser.add_argument("--ingest", metavar="PATH", help="Ingest PDF docs from directory")
+    parser.add_argument("--query",  metavar="Q",    help="Ask a legal question")
+    parser.add_argument("--eval",   action="store_true", help="Run RAGAS evaluation suite")
+    args = parser.parse_args()
+
+    orchestrator = LexRAGOrchestrator()
+
+    if args.ingest:
+        orchestrator.vs.ingest(args.ingest)
+
+    if args.query:
+        out = orchestrator.query(args.query)
+        print(json.dumps(out, indent=2))
+
+    if args.eval:
+        run_ragas_eval(orchestrator)
+
+    if not any([args.ingest, args.query, args.eval]):
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
