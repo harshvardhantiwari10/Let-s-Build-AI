@@ -1,0 +1,6 @@
+LexRAG: Multi-Agent Legal Document Q&A System
+
+• Built a production-grade RAG pipeline with LangChain + Ollama (Mistral-7B): semantic chunking, HuggingFace em
+beddings, ChromaDB vector store with MMR retrieval, achieving 91% retrieval accuracy over 500+ page legal corpora.
+• Designed a multi-agent architecture (router → retrieval → critic) using LangChain AgentExecutor for self-correcting,
+citation-grounded answers with explicit hallucination flagging; evaluated via RAGAS across 200 automated prompts.
