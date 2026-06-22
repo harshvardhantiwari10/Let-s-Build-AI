@@ -1,0 +1,31 @@
+"""
+SentinelLLM: Prompt Injection & LLM Safety Evaluation Framework
+================================================================
+Author : Harshvardhan Tiwari
+Stack  : LangChain · Ollama (Llama-3, Qwen) · DistilBERT · Antigravity · Matplotlib
+
+Architecture
+------------
+  Attack Generator (few-shot prompting)
+       ↓
+  LLM Under Test  ← Ollama (Llama-3 / Qwen / Mistral)
+       ↓
+  Safety Classifier (fine-tuned DistilBERT, 94% precision)
+       ↓
+  Antigravity Dashboard  ← structured safety report
+
+Attack Types Detected
+---------------------
+  • Prompt Injection    – overriding system prompt via user input
+  • Jailbreaks          – role-play / DAN / hypothetical bypass attempts
+  • Sensitive Data Leak – PII / credentials surfacing in LLM output
+  • Indirect Injection  – malicious instructions embedded in retrieved docs
+
+Run
+---
+  pip install -r requirements.txt
+  ollama pull llama3
+  python main.py --attack-gen 50     # generate adversarial test cases
+  python main.py --red-team          # run full red-team eval
+  python main.py --dashboard         # launch Antigravity safety report
+"""
